@@ -1,0 +1,162 @@
+# 2. Định nghĩa Cấu hình Mô phỏng Hành tinh (1d0154bf)
+
+@dataclass
+class ConstantsConfig:
+    SECONDS_PER_YEAR: float = 31557600.0
+    SCALE_FACTOR: float = 1_000_000.0
+    EARTH_REAL_RADIUS_M: float = 6_371_000.0
+    EARTH_RADIUS_SCALED: float = field(init=False)
+    EARTH_CIRCUMFERENCE_SCALED: float = field(init=False)
+    EARTH_ANGULAR_VELOCITY_RAD_PER_YEAR: float = field(init=False)
+    EARTH_GRAVITY: float = 9.80665
+    ROCK_DENSITY_KG_M3: float = 2700.0
+    MAGMA_DENSITY_KG_M3: float = 2500.0
+
+    def __post_init__(self):
+        self.EARTH_RADIUS_SCALED = self.EARTH_REAL_RADIUS_M / self.SCALE_FACTOR
+        self.EARTH_CIRCUMFERENCE_SCALED = 2 * np.pi * self.EARTH_RADIUS_SCALED
+        self.EARTH_ANGULAR_VELOCITY_RAD_PER_YEAR = 7.2921159e-5 * self.SECONDS_PER_YEAR
+
+@dataclass
+class SimulationConfig:
+    SIM_TIME: float = 1_000_000.0
+    DT_YEARS: float = 1.0
+    MAX_STEPS: int = 10000
+    SEED: Optional[int] = None
+    PAUSE_ON_ERROR: bool = True
+    VERBOSE: bool = False
+    VERBOSE_STEPS: int = 100
+    CFL_NUMBER: float = 0.5
+    DT_MIN_YEARS: float = 0.0001
+    DT_MAX_YEARS: float = 10.0
+
+@dataclass
+class GridConfig:
+    N_LAT: int = 128
+    N_LON: int = 257
+    GRID_SHAPE: Tuple[int, int] = field(init=False)
+    MEMORY_WARNING_THRESHOLD_CELLS: int = 10_000_000
+
+    def __post_init__(self):
+        self.GRID_SHAPE = (self.N_LAT, self.N_LON)
+        total_2d_cells = self.N_LAT * self.N_LON
+        if total_2d_cells > self.MEMORY_WARNING_THRESHOLD_CELLS:
+            print(f"⚠️ CẢNH BÁO CẤU HÌNH: Kích thước lưới 2D ({total_2d_cells} ô) vượt quá ngưỡng khuyến nghị "
+                  f"({self.MEMORY_WARNING_THRESHOLD_CELLS} ô). Điều này có thể dẫn đến việc sử dụng RAM cao và giảm hiệu suất.")
+
+@dataclass
+class EnvironmentConfig:
+    SEA_LEVEL_M: float = 0.0
+    MAX_INITIAL_ELEVATION_M: float = 10000.0
+    MIN_INITIAL_ELEVATION_M: float = -8000.0
+    WEATHERING_MOISTURE_THRESHOLD: float = 0.3
+    BIOMASS_GROWTH_RATE: float = 0.1
+    BIOMASS_CARRYING_CAPACITY: float = 1.0
+
+@dataclass
+class ErosionConfig:
+    FLUVIAL_SLOPE_THRESHOLD: float = np.radians(0.05)
+    FLUVIAL_MOISTURE_THRESHOLD: float = 0.3
+    HILLSLOPE_DIFFUSIVITY_M2_PER_YEAR: float = 1e-2
+    RIVER_CUT_RATE_M_PER_YEAR: float = 0.05
+    WEATHERING_RATE_M_PER_YEAR: float = 5.0e-4
+
+@dataclass
+class TectonicConfig:
+    PLATE_COUNT: int = 10
+    PLATE_OU_THETA: float = 0.01
+    PLATE_OU_SIGMA_ANGULAR_RAD_PER_SECOND: float = 1e-18
+    PLATE_OU_MU_OMEGA_RAD_PER_YEAR: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    PLATE_CONVERGENCE_THRESHOLD_KM_PER_YEAR: float = 0.01
+    MAX_UPLIFT_RATE_M_PER_YEAR: float = 0.005
+    MAX_SUBSIDENCE_RATE_M_PER_YEAR: float = 0.002
+    PLATE_CONVERGE_ALPHA: float = 1.0
+    PLATE_OPEN_ALPHA: float = 1.0
+    PLATE_OU_SIGMA_ANGULAR_RAD_PER_YEAR: float = field(init=False)
+
+
+@dataclass
+class MagmaDynamicsConfig:
+    MAGMA_RECHARGE_RATE: float = 1e-3
+    MAGMA_BOUNDARY_BOOST_FACTOR: float = 10.0
+    MAGMA_DIFFUSIVITY_SCALED_SQ_PER_YEAR: float = field(init=False)
+    MAGMA_UPLIFT_RATE_M_PER_YEAR: float = 0.001
+    MAGMA_CRITICAL_PRESSURE: float = 1e6
+    ERUPTION_PRESSURE_RESPONSE: float = 0.005
+    ERUPTION_MAGMA_CONSUMPTION_FACTOR: float = 10.0
+    EVENT_COOLDOWN_YEARS: float = 1000
+
+@dataclass
+class VolcanicGrid3DConfig:
+    GRID_SPACING_3D_M: float = 200.0
+    N_LAYERS_3D: int = 30
+    MAGMA_INJECTION_RATE_VOLUME_PER_SECOND: float = 1e-4
+    DT_3D_YEARS: float = 1.0
+    ATMOSPHERIC_PRESSURE_PA: float = 101325.0
+    FLUID_BULK_MODULUS_PA: float = 1e9
+    EFFECTIVE_VISCOSITY_PAS: float = 1e4
+    EXSOLUTION_PRESSURE_THRESHOLD_PA: float = 10e6
+    EXSOLUTION_RATE_PER_PA_SECOND: float = 1e-12
+    ROCK_STRENGTH_BACKGROUND_PA: float = 200e6
+    FRACTURE_THRESHOLD_MULTIPLIER: float = 0.8
+    VENT_PERMEABILITY_INCREASE_FACTOR: float = 1e3
+    VENT_POROSITY_INCREASE_ADDITIVE: float = 0.05
+    VENT_STRENGTH_REDUCTION_FACTOR: float = 0.5
+    ERUPTION_FLUX_COEFF_M3_PER_SECOND_PA_M2: float = 1e-10
+    GAS_THRESHOLD_EXPLOSIVE: float = 0.4
+    PRESSURE_GRADIENT_THRESHOLD_EXPLOSIVE_PA_PER_M: float = 1e5
+    EXPLOSIVE_FLUX_MULTIPLIER: float = 2.0
+    SOLIDIFICATION_FACTOR_EFFUSIVE: float = 0.9
+    SOLIDIFICATION_FACTOR_EXPLOSIVE: float = 0.2
+    VENT_SEALING_PRESSURE_THRESHOLD_PA: float = 1e6
+    VENT_SEALING_RATE_PER_SECOND: float = 1e-8
+    VENT_ACTIVITY_DECAY_RATE_PER_SECOND: float = 1e-7
+
+@dataclass
+class MineralConfig:
+    MINERAL_TYPE_CODES: ClassVar[Dict[str, int]] = {
+        'porphyry': 0,
+        'bif': 1,
+        'evaporite': 2,
+        'placer': 3
+    }
+    MINERAL_CODE_NAMES: Dict[int, str] = field(init=False)
+    MINERAL_PORPHYRY_CONVERGENT_PROXIMITY_RADIUS_KM: float = 100.0
+    MINERAL_BIF_SEA_LEVEL_PROXIMITY_M: float = 500.0
+    MINERAL_BIF_STABILITY_THRESHOLD: float = 0.1
+    MINERAL_EVAPORITE_MOISTURE_THRESHOLD: float = 0.2
+    MINERAL_EVAPORITE_ELEVATION_THRESHOLD_M: float = 1000.0
+    MINERAL_PLACER_SLOPE_THRESHOLD_RAD: float = np.radians(5.0)
+    MINERAL_PLACER_WATER_PROXIMITY_KM: float = 50.0
+
+    def __post_init__(self):
+        self.MINERAL_CODE_NAMES = {v: k for k, v in self.MINERAL_TYPE_CODES.items()}
+
+@dataclass
+class Config:
+    constants: ConstantsConfig = field(default_factory=ConstantsConfig)
+    simulation: SimulationConfig = field(default_factory=SimulationConfig)
+    grid: GridConfig = field(default_factory=GridConfig)
+    environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
+    erosion: ErosionConfig = field(default_factory=ErosionConfig)
+    tectonic: TectonicConfig = field(default_factory=TectonicConfig)
+    magma_dynamics: MagmaDynamicsConfig = field(default_factory=MagmaDynamicsConfig)
+    volcanic_grid_3d: VolcanicGrid3DConfig = field(default_factory=VolcanicGrid3DConfig)
+    mineral: MineralConfig = field(default_factory=MineralConfig)
+
+    def recalc(self):
+        self.tectonic.PLATE_OU_SIGMA_ANGULAR_RAD_PER_YEAR = self.tectonic.PLATE_OU_SIGMA_ANGULAR_RAD_PER_SECOND * self.constants.SECONDS_PER_YEAR
+        self.magma_dynamics.MAGMA_DIFFUSIVITY_SCALED_SQ_PER_YEAR = 1e-4 / (self.constants.SCALE_FACTOR**2)
+
+    def validate_config(self):
+        if self.tectonic.PLATE_OU_SIGMA_ANGULAR_RAD_PER_SECOND < 1e-20:
+            print(f"⚠️ CẢNH BÁO CẤU HÌNH: PLATE_OU_SIGMA_ANGULAR_RAD_PER_SECOND ({self.tectonic.PLATE_OU_SIGMA_ANGULAR_RAD_PER_SECOND:.1e}) quá nhỏ. Có thể gây ra vấn đề số học.")
+
+    def __post_init__(self):
+        self.recalc()
+        self.validate_config()
+
+_config = Config()
+
+def get_config() -> Config:
+    return _config
