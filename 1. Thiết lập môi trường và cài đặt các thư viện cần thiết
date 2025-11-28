@@ -1,0 +1,211 @@
+# 1. Thiết lập môi trường và cài đặt các thư viện cần thiết (b45fe273)
+import sys, subprocess, importlib
+import numpy as np
+from typing import Dict, Tuple, Optional, ClassVar, List
+from dataclasses import dataclass, field
+from IPython.display import Javascript, display
+from collections import deque
+import ipywidgets as widgets
+from plotly.graph_objs import FigureWidget
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
+
+import importlib.metadata as importlib_metadata
+from packaging.version import Version
+from packaging.requirements import Requirement
+
+def _check_module_imported(import_name: str) -> bool:
+    try:
+        importlib.import_module(import_name)
+        return True
+    except ImportError:
+        return False
+
+def _get_installed_version(package: str) -> Optional[Version]:
+    try:
+        return Version(importlib_metadata.version(package))
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+def ensure_package(package: str, version: str = None, import_name: str = None):
+    effective_import_name = import_name if import_name else package
+
+    current_status_msg = ""
+    perform_installation = False
+
+    if _check_module_imported(effective_import_name):
+        installed_ver = _get_installed_version(package)
+
+        if installed_ver:
+            if version:
+                requested_ver = Version(version)
+                if installed_ver >= requested_ver:
+                    current_status_msg = f"[CHECK] {package} OK (v{installed_ver})"
+                    print(current_status_msg)
+                    return True
+                else:
+                    current_status_msg = f"[UPDATE] Need to upgrade {package}: {installed_ver} -> {requested_ver}"
+                    perform_installation = True
+            else:
+                current_status_msg = f"[CHECK] {package} already available (v{installed_ver})."
+                print(current_status_msg)
+                return True
+        else:
+            current_status_msg = f"[WARNING] Module '{effective_import_name}' imported but package metadata for '{package}' not found. Proceeding with installation to ensure compatibility."
+            perform_installation = True
+    else:
+        if effective_import_name != package:
+            current_status_msg = f"[INSTALL] Module '{effective_import_name}' (part of package '{package}') not found. Installing..."
+        else:
+            current_status_msg = f"[INSTALL] Module '{effective_import_name}' not found. Installing package '{package}'..."
+        perform_installation = True
+
+    print(current_status_msg)
+
+    if perform_installation:
+        install_spec = f"{package}=={version}" if version else package
+        print(f"[INSTALL] Installing: {install_spec}")
+        try:
+            result = subprocess.run([sys.executable, "-m", "pip", "install", "-q", install_spec],
+                                   check=True, capture_output=True, text=True)
+            print(f"[SUCCESS] Successfully installed {install_spec}")
+            if result.stdout:
+                print(f"  Pip stdout: {result.stdout.strip()}")
+
+            if _check_module_imported(effective_import_name):
+                return True
+            else:
+                print(f"[ERROR] Installation of {install_spec} successful but could not import '{effective_import_name}'.")
+                return False
+
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] Failed to install {install_spec}: {e}")
+            if e.stderr: print(f"  Stderr: {e.stderr.strip()}")
+            if e.stdout: print(f"  Stdout: {e.stdout.strip()}")
+            return False
+        except Exception as e:
+            print(f"[ERROR] Unknown error while installing {install_spec}: {e}")
+            return False
+
+    return False
+
+def check_package_conflicts(package_names_to_check: Optional[List[str]] = None):
+    print("Checking for potential package conflicts...")
+
+    if not package_names_to_check:
+        print("No packages specified to check for conflicts. Skipping conflict check.")
+        return
+
+    all_installed_packages = {p.name.lower(): p for p in importlib_metadata.distributions()}
+    conflicts_found = False
+    parsing_errors = []
+
+    distributions_to_check = []
+    for name in package_names_to_check:
+        if name.lower() in all_installed_packages:
+            distributions_to_check.append(all_installed_packages[name.lower()])
+
+    for pkg_dist in distributions_to_check:
+        pkg_name = pkg_dist.name
+        try:
+            requires = pkg_dist.requires
+            if requires:
+                for req_str in requires:
+                    try:
+                        required_pkg = Requirement(req_str)
+                        if required_pkg.name.lower() in all_installed_packages:
+                            installed_version = Version(all_installed_packages[required_pkg.name.lower()].version)
+                            if required_pkg.specifier and not required_pkg.specifier.contains(installed_version):
+                                print(f"[COMPATIBILITY WARNING]: Package '{pkg_name}' requires '{required_pkg}', but '{required_pkg.name}' version '{installed_version}' is installed. Potential conflict!")
+                                conflicts_found = True
+                    except Exception as parse_e:
+                        parsing_errors.append(f"Error parsing requirement '{req_str}' for package '{pkg_name}': {parse_e}")
+        except Exception as e:
+            print(f"[ERROR] Error checking requirements for package '{pkg_name}': {e}")
+
+    if parsing_errors:
+        print(f"[WARNING]: Found {len(parsing_errors)} errors while parsing package requirements. Details:\n" +
+              "\n".join([f"  - {err}" for err in parsing_errors]))
+
+    if not conflicts_found:
+        print("\u2705 No obvious package conflicts found.")
+    else:
+        print("\u274c Potential package conflicts detected.")
+
+def setup_packages():
+    print("Checking/installing packages...")
+
+    packages_to_install = [
+        {"package": "plotly", "version": "5.18.0"},
+        {"package": "kaleido", "version": "0.2.1"},
+        {"package": "scikit-image", "import_name": "skimage"},
+        {"package": "scipy"},
+        {"package": "pandas"},
+        {"package": "packaging"},
+    ]
+
+    for item in packages_to_install:
+        pkg = item["package"]
+        ver = item.get("version")
+        import_name_for_check = item.get("import_name", pkg)
+
+        success = ensure_package(
+            package=pkg,
+            version=ver,
+            import_name=import_name_for_check
+        )
+        if not success:
+            print(f"[ERROR] Could not install {pkg}. Simulation might not work as expected.")
+
+    print("Checking package compatibility...")
+
+    plotly_version = _get_installed_version("plotly")
+    kaleido_version = _get_installed_version("kaleido")
+
+    if plotly_version and kaleido_version:
+        if plotly_version >= Version("5.0.0") and kaleido_version < Version("0.2.0"):
+            print(f"[COMPATIBILITY WARNING]: Plotly ({plotly_version}) is high version but Kaleido ({kaleido_version}) might be too old for Plotly image export. Consider upgrading Kaleido.")
+        else:
+            print(f"\u2705 Plotly ({plotly_version}) and Kaleido ({kaleido_version}) seem compatible.")
+    else:
+        print("[COMPATIBILITY WARNING]: Plotly or Kaleido not found. Cannot check compatibility.")
+
+    try:
+        import plotly.io as pio_module
+        if _check_module_imported('kaleido'):
+            if hasattr(pio_module, 'kaleido') and hasattr(pio_module.kaleido, 'scope'):
+                pio_module.kaleido.scope.default_format = "png"
+                print("\u2705 Configured Plotly to default image export to PNG via Kaleido.")
+            else:
+                print(f"[CONFIG WARNING]: pio.kaleido.scope object not found. Cannot configure Plotly for image export.")
+        else:
+            print("[CONFIG WARNING]: 'kaleido' module not successfully imported. Cannot configure Plotly for image export.")
+    except Exception as e:
+        print(f"[CONFIG WARNING]: Could not configure Plotly/Kaleido for image export. Error: {e}")
+
+    package_names_for_conflict_check = [item["package"] for item in packages_to_install]
+    check_package_conflicts(package_names_to_check=package_names_for_conflict_check)
+
+    print("\u2705 Setup complete.")
+
+setup_packages()
+
+import scipy.ndimage as ndi
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+import plotly.io as pio
+env = str(get_ipython())
+if 'google.colab' in env:
+    pio.renderers.default = "colab"
+elif "ipykernel" in env:
+    pio.renderers.default = "notebook"
+else:
+    pio.renderers.default = "json"
+
+GLOBAL_SIMULATION_SEED = 1762827170
+GLOBAL_RNG = np.random.default_rng(GLOBAL_SIMULATION_SEED)
+
+def random_noise_generator(shape, rng: np.random.Generator):
+    return rng.normal(size=shape)
