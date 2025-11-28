@@ -1,0 +1,317 @@
+# 3. Định nghĩa và Mô phỏng Lưới Núi lửa 3D (bed4704a)
+import numpy as np
+from typing import Dict, Tuple, Optional, ClassVar, List
+from dataclasses import dataclass, field
+
+from __main__ import Config, get_config, roll_with_poles, enforce_periodic_lon_boundary
+
+@dataclass
+class VolcanicGrid3D:
+    shape_3d: Tuple[int, int, int]
+    grid_spacing_m: float
+    initial_surface_elevation_m: np.ndarray
+    cfg: Config = field(init=False, repr=False)
+
+    pressure_fluid: np.ndarray = field(init=False)
+    magma_volume_fraction: np.ndarray = field(init=False)
+    gas_fraction: np.ndarray = field(init=False)
+    porosity: np.ndarray = field(init=False)
+    permeability: np.ndarray = field(init=False)
+    rock_strength: np.ndarray = field(init=False)
+    temperature: np.ndarray = field(init=False)
+    is_vent: np.ndarray = field(init=False)
+    vent_connection_to_surface: np.ndarray = field(init=False)
+    vent_activity_counter: np.ndarray = field(init=False)
+    elevation_surface: np.ndarray = field(init=False)
+
+    def __post_init__(self):
+        self.cfg = get_config()
+        n_layers, n_lat, n_lon = self.shape_3d
+
+        if self.initial_surface_elevation_m.shape != (n_lat, n_lon):
+            raise ValueError(f"initial_surface_elevation_m must have shape {(n_lat, n_lon)}, but got {self.initial_surface_elevation_m.shape}")
+
+        if n_layers < 1:
+            raise ValueError(f"Number of layers (n_layers) must be at least 1, but got {n_layers}")
+
+        self.pressure_fluid = np.full(self.shape_3d, self.cfg.volcanic_grid_3d.ATMOSPHERIC_PRESSURE_PA, dtype=np.float64)
+        self.magma_volume_fraction = np.zeros(self.shape_3d, dtype=np.float64)
+        self.gas_fraction = np.zeros(self.shape_3d, dtype=np.float64)
+        self.porosity = np.full(self.shape_3d, 0.01, dtype=np.float64)
+        self.permeability = np.full(self.shape_3d, 1e-15, dtype=np.float64)
+        self.rock_strength = np.full(self.shape_3d, self.cfg.volcanic_grid_3d.ROCK_STRENGTH_BACKGROUND_PA, dtype=np.float64)
+        self.temperature = np.full(self.shape_3d, 300.0, dtype=np.float64)
+        self.is_vent = np.zeros(self.shape_3d, dtype=bool)
+        self.vent_connection_to_surface = np.zeros(self.shape_3d, dtype=bool)
+        self.vent_activity_counter = np.zeros(self.shape_3d, dtype=np.float64)
+
+        self.elevation_surface = self.initial_surface_elevation_m.copy()
+
+        self.update_pressure_from_elevation()
+
+    def update_pressure_from_elevation(self):
+        n_layers, n_lat, n_lon = self.shape_3d
+        rho_rock = self.cfg.constants.ROCK_DENSITY_KG_M3
+        g = self.cfg.constants.EARTH_GRAVITY
+
+        depth_from_surface_3d = (np.arange(n_layers)[:, None, None] + 0.5) * self.grid_spacing_m
+
+        lithostatic_pressure = rho_rock * g * depth_from_surface_3d
+
+        self.pressure_fluid[:] = lithostatic_pressure
+
+        self.pressure_fluid[0, :, :] += self.cfg.volcanic_grid_3d.ATMOSPHERIC_PRESSURE_PA
+
+        self.pressure_fluid = np.clip(self.pressure_fluid, self.cfg.volcanic_grid_3d.ATMOSPHERIC_PRESSURE_PA, 5e10)
+
+    def _clip_fluid_fractions(self):
+        self.magma_volume_fraction = np.clip(self.magma_volume_fraction, 0, self.porosity)
+        self.gas_fraction = np.clip(self.gas_fraction, 0, self.porosity - self.magma_volume_fraction)
+        total_fluid = self.magma_volume_fraction + self.gas_fraction
+        exceed_mask = total_fluid > self.porosity
+        if np.any(exceed_mask):
+            scale_factor = self.porosity[exceed_mask] / (total_fluid[exceed_mask] + 1e-12)
+            self.magma_volume_fraction[exceed_mask] *= scale_factor
+            self.gas_fraction[exceed_mask] *= scale_factor
+
+    def _simulate_darcy_flow(self, dt_seconds: float):
+        n_layers, n_lat, n_lon = self.shape_3d
+        grid_spacing = self.grid_spacing_m
+        P = self.pressure_fluid
+        K = self.permeability
+        mu = self.cfg.volcanic_grid_3d.EFFECTIVE_VISCOSITY_PAS
+
+        d_magma_vol_frac_dt = np.zeros(self.shape_3d, dtype=np.float64)
+
+        if n_layers > 1:
+            K_z_interface = 2 * K[:-1, :, :] * K[1:, :, :] / (K[:-1, :, :] + K[1:, :, :] + 1e-18)
+
+            flux_z_down_interface = (K_z_interface / mu) * (P[:-1, :, :] - P[1:, :, :]) / grid_spacing
+
+            d_magma_vol_frac_dt[:-1, :, :] -= flux_z_down_interface / grid_spacing
+            d_magma_vol_frac_dt[1:, :, :] += flux_z_down_interface / grid_spacing
+
+        P_north = roll_with_poles(P, 1, axis=1)
+        K_north = roll_with_poles(K, 1, axis=1)
+        K_interface_north = 2 * K * K_north / (K + K_north + 1e-18)
+        flux_to_north = (K_interface_north / mu) * (P - P_north) / grid_spacing
+
+        P_south = roll_with_poles(P, -1, axis=1)
+        K_south = roll_with_poles(K, -1, axis=1)
+        K_interface_south = 2 * K * K_south / (K + K_south + 1e-18)
+        flux_to_south = (K_interface_south / mu) * (P - P_south) / grid_spacing
+
+        d_magma_vol_frac_dt -= flux_to_north / grid_spacing
+        d_magma_vol_frac_dt += roll_with_poles(flux_to_north, -1, axis=1) / grid_spacing
+
+        d_magma_vol_frac_dt -= flux_to_south / grid_spacing
+        d_magma_vol_frac_dt += roll_with_poles(flux_to_south, 1, axis=1) / grid_spacing
+
+        P_east = np.roll(P, -1, axis=2)
+        K_east = np.roll(K, -1, axis=2)
+        K_interface_east = 2 * K * K_east / (K + K_east + 1e-18)
+        flux_to_east = (K_interface_east / mu) * (P - P_east) / grid_spacing
+
+        P_west = np.roll(P, 1, axis=2)
+        K_west = np.roll(K, 1, axis=2)
+        K_interface_west = 2 * K * K_west / (K + K_west + 1e-18)
+        flux_to_west = (K_interface_west / mu) * (P - P_west) / grid_spacing
+
+        d_magma_vol_frac_dt -= flux_to_east / grid_spacing
+        d_magma_vol_frac_dt += np.roll(flux_to_east, 1, axis=2) / grid_spacing
+
+        d_magma_vol_frac_dt -= flux_to_west / grid_spacing
+        d_magma_vol_frac_dt += np.roll(flux_to_west, -1, axis=2) / grid_spacing
+
+        self.magma_volume_fraction += d_magma_vol_frac_dt * dt_seconds
+        self._clip_fluid_fractions()
+
+    def _simulate_exsolution(self, dt_seconds: float):
+        exsolution_mask = (self.pressure_fluid < self.cfg.magma_dynamics.MAGMA_CRITICAL_PRESSURE) & (self.magma_volume_fraction > 0)
+
+        if np.any(exsolution_mask):
+            pressure_deficit = np.maximum(self.cfg.magma_dynamics.MAGMA_CRITICAL_PRESSURE - self.pressure_fluid[exsolution_mask], 0)
+            exsolution_rate = pressure_deficit * self.cfg.volcanic_grid_3d.EXSOLUTION_RATE_PER_PA_SECOND
+
+            potential_gas_exsolved_vol_frac = exsolution_rate * dt_seconds
+
+            available_magma = self.magma_volume_fraction[exsolution_mask]
+            gas_exsolved_vol_frac = np.minimum(potential_gas_exsolved_vol_frac, available_magma)
+
+            self.gas_fraction[exsolution_mask] += gas_exsolved_vol_frac
+            self.magma_volume_fraction[exsolution_mask] -= gas_exsolved_vol_frac
+
+            self.magma_volume_fraction[exsolution_mask] = np.clip(self.magma_volume_fraction[exsolution_mask], 0, self.porosity[exsolution_mask])
+            self.gas_fraction[exsolution_mask] = np.clip(self.gas_fraction[exsolution_mask], 0, self.porosity[exsolution_mask] - self.magma_volume_fraction[exsolution_mask])
+
+            self._clip_fluid_fractions()
+
+    def _check_and_form_vents(self):
+        n_layers, n_lat, n_lon = self.shape_3d
+        potential_vent_layers_slice = slice(0, min(5, n_layers))
+
+        fracture_mask_sub_grid = ((
+            self.pressure_fluid[potential_vent_layers_slice, :, :] >
+            self.rock_strength[potential_vent_layers_slice, :, :] * self.cfg.volcanic_grid_3d.FRACTURE_THRESHOLD_MULTIPLIER) &
+            (self.magma_volume_fraction[potential_vent_layers_slice, :, :] > 0)
+        )
+
+        if np.any(fracture_mask_sub_grid):
+            temp_mask_sub_grid = np.zeros((potential_vent_layers_slice.stop, n_lat, n_lon), dtype=bool)
+            temp_mask_sub_grid[fracture_mask_sub_grid] = True
+            vent_columns_2d = np.any(temp_mask_sub_grid, axis=0)
+
+            for k_idx in range(potential_vent_layers_slice.stop):
+                cells_to_update_in_layer = np.zeros((n_lat, n_lon), dtype=bool)
+                cells_to_update_in_layer[vent_columns_2d] = True
+
+                self.is_vent[k_idx, :, :][cells_to_update_in_layer] = True
+                self.permeability[k_idx, :, :][cells_to_update_in_layer] *= self.cfg.volcanic_grid_3d.VENT_PERMEABILITY_INCREASE_FACTOR
+                self.porosity[k_idx, :, :][cells_to_update_in_layer] += self.cfg.volcanic_grid_3d.VENT_POROSITY_INCREASE_ADDITIVE
+                self.porosity[k_idx, :, :][cells_to_update_in_layer] = np.clip(self.porosity[k_idx, :, :][cells_to_update_in_layer], 1e-6, 0.5)
+                self.rock_strength[k_idx, :, :][cells_to_update_in_layer] *= self.cfg.volcanic_grid_3d.VENT_STRENGTH_REDUCTION_FACTOR
+
+                if k_idx == 0:
+                    self.vent_connection_to_surface[k_idx, :, :][cells_to_update_in_layer] = True
+                else:
+                    self.vent_connection_to_surface[k_idx, :, :][cells_to_update_in_layer] = (
+                        self.vent_connection_to_surface[k_idx-1, :, :][cells_to_update_in_layer])
+
+            active_vents_mask = self.is_vent.copy()
+            self.vent_activity_counter[active_vents_mask] = self.cfg.magma_dynamics.EVENT_COOLDOWN_YEARS * self.cfg.constants.SECONDS_PER_YEAR
+
+    def _simulate_eruption(self, dt_seconds: float, planet: 'Planet'):
+        surface_vents_mask = self.is_vent[0, :, :] & self.vent_connection_to_surface[0, :, :]
+
+        if np.any(surface_vents_mask):
+            vent_pressure = self.pressure_fluid[0, :, :][surface_vents_mask]
+            vent_magma_frac = self.magma_volume_fraction[0, :, :][surface_vents_mask]
+            vent_gas_frac = self.gas_fraction[0, :, :][surface_vents_mask]
+
+            pressure_difference = vent_pressure - self.cfg.volcanic_grid_3d.ATMOSPHERIC_PRESSURE_PA
+            erupting_mask = (pressure_difference > 0)
+
+            if np.any(erupting_mask):
+                erupting_vent_pressure_diff = pressure_difference[erupting_mask]
+                erupting_vent_magma_frac = vent_magma_frac[erupting_mask]
+                erupting_vent_gas_frac = vent_gas_frac[erupting_mask]
+
+                flux_m3_per_s_per_m2 = self.cfg.volcanic_grid_3d.ERUPTION_FLUX_COEFF_M3_PER_SECOND_PA_M2 * erupting_vent_pressure_diff
+
+                explosive_mask = (
+                    erupting_vent_gas_frac > self.cfg.volcanic_grid_3d.GAS_THRESHOLD_EXPLOSIVE
+                ) | (
+                    erupting_vent_pressure_diff / self.grid_spacing_m > self.cfg.volcanic_grid_3d.PRESSURE_GRADIENT_THRESHOLD_EXPLOSIVE_PA_PER_M
+                )
+
+                flux_m3_per_s_per_m2[explosive_mask] *= self.cfg.volcanic_grid_3d.EXPLOSIVE_FLUX_MULTIPLIER
+
+                cell_area = self.grid_spacing_m**2
+                erupted_volume_per_cell = flux_m3_per_s_per_m2 * cell_area * dt_seconds
+
+                idx_surface_vents_all = np.where(surface_vents_mask)
+                erupting_indices = np.where(erupting_mask)[0]
+
+                erupting_lat_indices = idx_surface_vents_all[0][erupting_indices]
+                erupting_lon_indices = idx_surface_vents_all[1][erupting_indices]
+
+                available_porosity_at_surface_vents = self.porosity[0, erupting_lat_indices, erupting_lon_indices]
+                effective_porosity_for_div = np.maximum(available_porosity_at_surface_vents, 1e-12)
+
+                available_magma_volume = erupting_vent_magma_frac * available_porosity_at_surface_vents * (self.grid_spacing_m**3)
+                actual_erupted_volume = np.minimum(erupted_volume_per_cell, available_magma_volume)
+
+                planet.total_erupted_volume_m3_sim += np.sum(actual_erupted_volume)
+
+                delta_magma_vol_frac = actual_erupted_volume / (effective_porosity_for_div * (self.grid_spacing_m**3))
+
+                self.magma_volume_fraction[0, erupting_lat_indices, erupting_lon_indices] -= delta_magma_vol_frac
+                self.pressure_fluid[0, erupting_lat_indices, erupting_lon_indices] -= (
+                    delta_magma_vol_frac * self.cfg.magma_dynamics.ERUPTION_PRESSURE_RESPONSE * self.cfg.volcanic_grid_3d.FLUID_BULK_MODULUS_PA)
+
+                safe_erupting_magma_frac = np.maximum(erupting_vent_magma_frac, 1e-12)
+                gas_reduction_factor = erupting_vent_gas_frac / safe_erupting_magma_frac
+                gas_reduction = delta_magma_vol_frac * gas_reduction_factor
+
+                current_porosity = self.porosity[0, erupting_lat_indices, erupting_lon_indices]
+                current_magma_fraction = self.magma_volume_fraction[0, erupting_lat_indices, erupting_lon_indices]
+
+                self.gas_fraction[0, erupting_lat_indices, erupting_lon_indices] = np.clip(
+                    self.gas_fraction[0, erupting_lat_indices, erupting_lon_indices] - gas_reduction,
+                    0, current_porosity - current_magma_fraction
+                )
+
+                effusive_erupted_height = np.where(~explosive_mask, actual_erupted_volume / cell_area * (1 - self.cfg.volcanic_grid_3d.SOLIDIFICATION_FACTOR_EFFUSIVE), 0)
+                explosive_erupted_height = np.where(explosive_mask, actual_erupted_volume / cell_area * (1 - self.cfg.volcanic_grid_3d.SOLIDIFICATION_FACTOR_EXPLOSIVE), 0)
+
+                planet.elevation[erupting_lat_indices, erupting_lon_indices] += planet.to_scaled(effusive_erupted_height + explosive_erupted_height)
+                enforce_periodic_lon_boundary(planet.elevation)
+
+                sealing_mask = (self.pressure_fluid[0, erupting_lat_indices, erupting_lon_indices] < self.cfg.volcanic_grid_3d.VENT_SEALING_PRESSURE_THRESHOLD_PA)
+                if np.any(sealing_mask):
+                    self.vent_activity_counter[0, erupting_lat_indices[sealing_mask], erupting_lon_indices[sealing_mask]] = np.maximum(0, self.vent_activity_counter[0, erupting_lat_indices[sealing_mask], erupting_lon_indices[sealing_mask]] - self.cfg.volcanic_grid_3d.VENT_SEALING_RATE_PER_SECOND * dt_seconds)
+
+                self._clip_fluid_fractions()
+                self.pressure_fluid[:] = np.clip(self.pressure_fluid, 1e5, 5e10)
+
+    def simulate_one_step(self, dt_seconds: float, planet: 'Planet'):
+        n_layers, n_lat, n_lon = self.shape_3d
+        config = self.cfg
+
+        res_center_lat = np.clip(n_lat // 2 + 5, 0, n_lat - 1)
+        res_center_lon = np.clip(n_lon // 2 + 10, 0, n_lon - 1)
+        res_bottom_layer = np.clip(n_layers - 5, 0, n_layers - 1)
+        res_top_layer = np.clip(n_layers - 10, 0, n_layers - 1)
+        if res_top_layer > res_bottom_layer:
+            res_top_layer = res_bottom_layer
+        res_top_layer = np.maximum(0, res_top_layer)
+
+        res_radius_cells = 8
+
+        lat_coords, lon_coords = np.indices((n_lat, n_lon))
+        dist_sq = (lat_coords - res_center_lat)**2 + (lon_coords - res_center_lon)**2
+        reservoir_mask_2d = dist_sq <= res_radius_cells**2
+
+        reservoir_mask_3d = np.zeros(self.shape_3d, dtype=bool)
+        for layer in range(res_top_layer, res_bottom_layer + 1):
+            reservoir_mask_3d[layer, :, :] = reservoir_mask_2d
+
+        num_reservoir_cells = np.count_nonzero(reservoir_mask_3d)
+        magma_injection_rate_volume_per_second = config.volcanic_grid_3d.MAGMA_INJECTION_RATE_VOLUME_PER_SECOND
+
+        if num_reservoir_cells > 0:
+            source_volume_per_cell_per_second = magma_injection_rate_volume_per_second / num_reservoir_cells
+            source_rate_per_unit_volume_per_second = source_volume_per_cell_per_second / (self.grid_spacing_m**3)
+
+            self.magma_volume_fraction[reservoir_mask_3d] += source_rate_per_unit_volume_per_second * dt_seconds
+            self._clip_fluid_fractions()
+            enforce_periodic_lon_boundary(self.magma_volume_fraction)
+
+            fluid_bulk_modulus = config.volcanic_grid_3d.FLUID_BULK_MODULUS_PA
+            effective_porosity_res = np.maximum(self.porosity[reservoir_mask_3d], 1e-9)
+            pressure_increase_from_source = (fluid_bulk_modulus / effective_porosity_res) * source_rate_per_unit_volume_per_second * dt_seconds
+
+            full_3d_pressure_increase = np.zeros(self.shape_3d, dtype=np.float64)
+            full_3d_pressure_increase[reservoir_mask_3d] = pressure_increase_from_source
+            self.pressure_fluid += full_3d_pressure_increase
+            self.pressure_fluid = np.clip(self.pressure_fluid, 1e5, 5e10)
+            enforce_periodic_lon_boundary(self.pressure_fluid)
+
+        self._simulate_darcy_flow(dt_seconds)
+        self._simulate_exsolution(dt_seconds)
+        self._check_and_form_vents()
+        self._simulate_eruption(dt_seconds, planet)
+
+        self.pressure_fluid[:] = np.clip(self.pressure_fluid, 1e5, 5e10)
+
+        enforce_periodic_lon_boundary(self.magma_volume_fraction)
+        enforce_periodic_lon_boundary(self.gas_fraction)
+        enforce_periodic_lon_boundary(self.pressure_fluid)
+        enforce_periodic_lon_boundary(self.permeability)
+        enforce_periodic_lon_boundary(self.porosity)
+        enforce_periodic_lon_boundary(self.rock_strength)
+        enforce_periodic_lon_boundary(self.is_vent)
+        enforce_periodic_lon_boundary(self.vent_connection_to_surface)
+        enforce_periodic_lon_boundary(self.vent_activity_counter)
+
+        return self
